@@ -1,0 +1,9 @@
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import { issueSession, validSession, assertOrigin, allowLogin } from "./operator";
+beforeEach(() => { vi.unstubAllEnvs(); vi.stubEnv("POS_SESSION_SECRET", "a-test-session-secret-at-least-32-characters"); vi.stubEnv("POS_OPERATOR_PASSWORD", "a-strong-test-password"); vi.stubEnv("POS_ORIGIN", "https://pos.example.com"); });
+describe("operator boundary", () => {
+  it("rejects altered, expired and password-rotated cookies", () => { const now = Date.now(); const session = issueSession(now); expect(validSession(session, now)).toBe(true); expect(validSession(`${session}x`, now)).toBe(false); expect(validSession(session, now + 8*3600000)).toBe(false); vi.stubEnv("POS_OPERATOR_PASSWORD", "changed-operator-password"); expect(validSession(session, now)).toBe(false); });
+  it("rejects cross-origin mutations", () => { expect(() => assertOrigin(new Request("https://pos.example.com", { headers: { origin: "https://evil.example" } }))).toThrow(); expect(() => assertOrigin(new Request("https://pos.example.com", { headers: { origin: "https://pos.example.com" } }))).not.toThrow(); });
+  it("fails closed when Vercel has no distributed login protection", async () => { vi.stubEnv("VERCEL", "1"); vi.stubEnv("POS_LOGIN_FIREWALL_ENABLED", "false"); await expect(allowLogin(new Request("https://pos.example.com"))).rejects.toThrow("Distributed login protection"); });
+  it("fails closed when the distributed counter is unavailable", async () => { vi.stubEnv("UPSTASH_REDIS_REST_URL", "https://redis.example.com"); vi.stubEnv("UPSTASH_REDIS_REST_TOKEN", "test"); vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("unavailable", {status:503}))); await expect(allowLogin(new Request("https://pos.example.com"))).rejects.toThrow("temporarily unavailable"); vi.unstubAllGlobals(); });
+});

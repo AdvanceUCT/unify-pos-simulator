@@ -1,0 +1,6 @@
+{
+  "name": "unify-pos-simulator", "version": "0.1.0", "private": true,
+  "scripts": { "dev": "next dev", "build": "next build", "start": "next start", "typecheck": "tsc --noEmit", "lint": "eslint .", "test": "vitest run" },
+  "dependencies": { "next": "16.2.6", "react": "19.2.4", "react-dom": "19.2.4", "qrcode": "^1.5.4", "zod": "^4.3.6" },
+  "devDependencies": { "typescript": "^5.9.3", "@types/node": "^24", "@types/react": "^19", "@types/react-dom": "^19", "@types/qrcode": "^1.5.6", "eslint": "^9", "eslint-config-next": "16.2.6", "vitest": "^4.0.16" }
+}
