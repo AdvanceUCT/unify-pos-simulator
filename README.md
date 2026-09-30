@@ -60,6 +60,16 @@ Signed payment callbacks are documented in [payment-callbacks.md](docs/payment-c
 
 ## Checks and deployment
 
-`npm run typecheck`, `npm run lint`, `npm test`, `npm run build`. For this implementation, run automated checks in CI; use Vercel CLI for deployment and deployed checks. EC2 hosts only the agent backend. Keep secrets out of public source and browser bundles.
+`npm run typecheck`, `npm run lint`, `npm test`, `npm run build`. Run automated checks in CI with an isolated test database where needed; use Vercel CLI for deployment and deployed checks. EC2 hosts the agent backend service. Compile the signed Android release on the Windows workstation using its installed SDK and existing signing setup. Keep secrets out of public source and browser bundles.
 
 Deploy the portal migration/APIs first, then the wallet and simulator. Configure a dedicated test key, deploy with `vercel --prod`, and check login, protected sales routes and checkout recovery at the public HTTPS URL. API examples require the new portal version; an older portal returns 404.
+
+## Coordinated implementation and acceptance
+
+The payment APIs and owner-managed keys are reviewed in [portal PR #109](https://github.com/AdvanceUCT/unify-admin-portal/pull/109). Wallet scanning, confirmation and payment recovery are reviewed in [wallet PR #78](https://github.com/AdvanceUCT/unify-student-wallet/pull/78). The simulator implementation is already committed on this repository's main branch.
+
+The deployed demo uses the approved TechNest vendor and Rondebosch Branch. Its vendor key can create, read and cancel payment requests for that branch. Configure all keys and operator secrets in the hosting environment; do not publish them in this repository.
+
+Portal, wallet and simulator CI checks passed. The payment checks exercised concurrent payers, repeat submissions, cancellation, expiry, insufficient funds and transaction rollback against PostgreSQL. Deployed simulator checks confirmed protected routes, session cookies, same-origin changes, integer totals, recovery after a lost creation response, repeated cancellation and ten-minute expiry. A signed Android APK was compiled on Windows; its release certificate matches the portal's Android App Links certificate and it contains only phone ARM architectures.
+
+Physical phone acceptance is still outstanding. Run the demo steps above and match the completed payment and receipt across the wallet, POS and portal before closing AD-218 or AD-219. Supporting wallet changes do not complete AD-224, AD-225 or AD-227. Refund execution and callbacks remain separate work.
