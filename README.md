@@ -56,10 +56,10 @@ States are `PENDING`, `PAID`, `CANCELLED`, `EXPIRED`. Requests expire after ten 
 6. Let a request expire; verify neither a stale QR nor a delayed approval can debit it.
 7. Interrupt connectivity after create/pay submission; recover the original reference and verify only one request/spend exists. Refresh the browser and recover recent sales.
 
-API callbacks, refund execution, FIFO refund obligations and payout changes are separate increments. The API supports refund scopes for future use; this terminal has no refund control.
+Signed payment callbacks are documented in [payment-callbacks.md](docs/payment-callbacks.md). Refund execution, FIFO refund obligations and payout changes are separate increments. The API supports refund scopes for future use; this terminal has no refund control.
 
 ## Checks and deployment
 
-`npm run typecheck`, `npm run lint`, `npm test`, `npm run build`. For this implementation, run checks on the team's EC2 validation workspace or CI; use Vercel CLI for deployment and deployed checks. Keep secrets out of public source and browser bundles.
+`npm run typecheck`, `npm run lint`, `npm test`, `npm run build`. For this implementation, run automated checks in CI; use Vercel CLI for deployment and deployed checks. EC2 hosts only the agent backend. Keep secrets out of public source and browser bundles.
 
 Deploy the portal migration/APIs first, then the wallet and simulator. Configure a dedicated test key, deploy with `vercel --prod`, and check login, protected sales routes and checkout recovery at the public HTTPS URL. API examples require the new portal version; an older portal returns 404.
