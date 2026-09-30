@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 const COOKIE = "unify_pos_operator";
 const MAX_AGE = 8 * 60 * 60;
 const attempts = new Map<string, { count: number; expires: number }>();
+export class InvalidOriginError extends Error {}
 function sessionKey() {
   const secret = process.env.POS_SESSION_SECRET;
   if (!secret || secret.length < 32) throw new Error("Operator access is not configured.");
@@ -27,7 +28,7 @@ export async function saveOperatorSession() { (await cookies()).set(COOKIE, issu
 export async function clearOperatorSession() { (await cookies()).delete(COOKIE); }
 export function assertOrigin(request: Request) {
   const configured = process.env.POS_ORIGIN;
-  if (!configured || request.headers.get("origin") !== new URL(configured).origin) throw new Error("Invalid request origin.");
+  if (!configured || request.headers.get("origin") !== new URL(configured).origin) throw new InvalidOriginError("Invalid request origin.");
 }
 export async function allowLogin(request: Request) {
   const address = request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";

@@ -31,7 +31,7 @@ export function Terminal() {
   async function refreshHistory(next?: string) {
     try { const result = await api(next ? `?cursor=${encodeURIComponent(next)}` : ""); const items = result.items.map((item: unknown) => requestSchema.parse(item)); setHistory((old) => next ? [...old, ...items] : items); setCursor(result.nextCursor); } catch(error) { setError(error instanceof Error ? error.message : "History is unavailable."); }
   }
-  function accept(result: PaymentRequest) { setRequest(result); setSynced(new Date().toLocaleTimeString()); setError(""); }
+  function accept(result: PaymentRequest) { if (current.current?.requestId && current.current.requestId !== result.id) return; setRequest((previous) => previous?.id === result.id && previous.status !== "PENDING" ? previous : result); setSynced(new Date().toLocaleTimeString()); setError(""); }
   useEffect(() => {
     let initial: Saved;
     try { const raw = JSON.parse(localStorage.getItem(STORAGE) ?? "null"); const sale = saleSchema.parse(raw?.sale); sale.items = sale.items.map((item) => ({ ...item, id: item.id ?? crypto.randomUUID() })); initial = { sale, submitted: raw.submitted === true, requestId: /^[A-Za-z0-9_-]{32}$/.test(raw.requestId ?? "") ? raw.requestId : undefined, snapshots: raw.snapshots && typeof raw.snapshots === "object" ? raw.snapshots : {} }; }
@@ -48,13 +48,14 @@ export function Terminal() {
     void QRCode.toDataURL(request.qrPayload, { width: 480, margin: 4, errorCorrectionLevel: "M", color: { dark: "#102820", light: "#ffffff" } }).then((url) => { if(active) setQr({ id: request.id, url }); });
     return () => { active = false; };
   }, [request]);
+  const activeRequestId = saved?.requestId;
   useEffect(() => {
-    if (!saved?.requestId || request?.status && request.status !== "PENDING") return;
+    if (!activeRequestId || request?.status && request.status !== "PENDING") return;
     let stopped = false; let delay = 2000; let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       if(stopped) return;
       try {
-        const next = requestSchema.parse(await api(`/${saved!.requestId}`));
+        const next = requestSchema.parse(await api(`/${activeRequestId}`));
         if(stopped) return; accept(next); delay = 2000;
         if(next.status !== "PENDING") { void refreshHistory(); return; }
       } catch(error) { if(stopped) return; setError(error instanceof Error ? error.message : "Connection lost. Checking the same sale again."); delay = Math.min(delay * 2, 30_000); }
@@ -64,7 +65,7 @@ export function Terminal() {
     timer = setTimeout(poll, 2000); window.addEventListener("online", reconnect);
     return () => { stopped = true; clearTimeout(timer); window.removeEventListener("online", reconnect); };
     // Polling owns a stable request reference and stops only on server-confirmed terminal state.
-  }, [saved?.requestId, request?.status]);
+  }, [activeRequestId, request?.status]);
   async function create() {
     if(guard.current || !current.current) return; guard.current = true; setBusy(true); setError("");
     try {

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { isOperator, assertOrigin } from "@/lib/operator";
+import { isOperator, assertOrigin, InvalidOriginError } from "@/lib/operator";
 import { saleSchema, saleTotal, requestSchema } from "@/lib/contracts";
 import { upstream } from "@/lib/upstream";
 export async function POST(request: Request) {
@@ -10,7 +10,7 @@ export async function POST(request: Request) {
   const sale = saleSchema.parse(await request.json());
   const result = requestSchema.parse(await upstream("", { method: "POST", body: { branchId: process.env.UNIFY_BRANCH_ID, orderReference: sale.orderReference, amountMinor: saleTotal(sale.items), currency: "ZAR", idempotencyKey: sale.idempotencyKey } }));
   return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
- } catch(error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Sale result is unknown. Retry with the same reference." }, { status: 400 }); }
+ } catch(error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Sale result is unknown. Retry with the same reference." }, { status: error instanceof InvalidOriginError ? 403 : 400 }); }
 }
 export async function GET(request: Request) {
  if (!await isOperator()) return NextResponse.json({ error: "Operator login required." }, { status: 401 });
