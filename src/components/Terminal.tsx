@@ -1,10 +1,11 @@
 /* eslint-disable @next/next/no-img-element -- QR is a locally generated data URI, not remote media. */
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Link from "next/link";
-import { money, parsePrice, refundResultSchema, requestSchema, saleSchema, type PaymentRequest, type RefundResult, type Sale } from "@/lib/contracts";
+import { money, parsePrice, requestSchema, saleSchema, type PaymentRequest, type RefundResult, type Sale } from "@/lib/contracts";
+import { RefundRecoveryClient } from "@/lib/refundRecoveryClient";
 const STORAGE = "unify.pos.terminal.v1";
 const REFUND_STORAGE = "unify.pos.refund.v1";
 // Saved before the call so an unknown outcome is retried with the same key (UNIFY replays, never refunds twice).
@@ -31,37 +32,48 @@ export function Terminal() {
   const router = useRouter();
   const [saved, setSaved] = useState<Saved>(); const [request, setRequest] = useState<PaymentRequest>();
   const [history, setHistory] = useState<PaymentRequest[]>([]); const [cursor, setCursor] = useState<string | null>(null);
-  const [error, setError] = useState(""); const [busy, setBusy] = useState(false); const [qr, setQr] = useState<{ id: string; url: string }>(); const [now, setNow] = useState(0);
+  const [error, setError] = useState(""); const [saleBusy, setBusy] = useState(false); const [qr, setQr] = useState<{ id: string; url: string }>(); const [now, setNow] = useState(0);
   const [customer, setCustomer] = useState(false); const [synced, setSynced] = useState(""); const guard = useRef(false); const current = useRef<Saved | undefined>(undefined);
   const [refundOpen, setRefundOpen] = useState(false); const [refundText, setRefundText] = useState(""); const [refundNotice, setRefundNotice] = useState("");
-  const [pendingRefund, setPendingRefund] = useState<RefundIntent>(); const [lastRefund, setLastRefund] = useState<RefundResult>(); const [printing, setPrinting] = useState<"receipt" | "refund">("receipt");
+  const [refundClient] = useState(() => new RefundRecoveryClient({ baseUrl: "/api/refund-operations", storage: () => localStorage, legacyDraft: () => { const legacy = readRefundIntent(); return legacy ? { paymentRequestId: legacy.requestId, amountMinor: legacy.amountMinor, idempotencyKey: legacy.idempotencyKey } : undefined; }, clearLegacy: () => localStorage.removeItem(REFUND_STORAGE) }));
+  const recovery = useSyncExternalStore(refundClient.subscribe, refundClient.getSnapshot, refundClient.getServerSnapshot);
+  const pendingRefund = recovery.draft;
+  const refundBlocked = !recovery.hydrated || recovery.busy || Boolean(recovery.operation || pendingRefund);
+  const busy = saleBusy || recovery.busy;
+  const handledOutcome = useRef<string | undefined>(undefined);
+  const [lastRefund, setLastRefund] = useState<RefundResult>(); const [printing, setPrinting] = useState<"receipt" | "refund">("receipt");
   function persist(next: Saved) { localStorage.setItem(STORAGE, JSON.stringify(next)); current.current = next; setSaved(next); }
   async function refreshHistory(next?: string) {
     try { const result = await api(next ? `?cursor=${encodeURIComponent(next)}` : ""); const items = result.items.map((item: unknown) => requestSchema.parse(item)); setHistory((old) => next ? [...old, ...items] : items); setCursor(result.nextCursor); } catch(error) { setError(error instanceof Error ? error.message : "History is unavailable."); }
   }
   // A terminal state never regresses to PENDING, but later reads may carry newer refund totals.
   function accept(result: PaymentRequest) { if (current.current?.requestId && current.current.requestId !== result.id) return; setRequest((previous) => previous?.id === result.id && previous.status !== "PENDING" && result.status === "PENDING" ? previous : result); setSynced(new Date().toLocaleTimeString()); setError(""); }
-  function clearRefundIntent() { localStorage.removeItem(REFUND_STORAGE); setPendingRefund(undefined); }
-  async function submitRefund(intent: RefundIntent) {
-    if(guard.current) return; guard.current = true; setBusy(true); setRefundNotice("");
-    localStorage.setItem(REFUND_STORAGE, JSON.stringify(intent)); setPendingRefund(intent);
-    try {
-      const response = await fetch(`/api/sales/${intent.requestId}/refunds`, { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ amountMinor: intent.amountMinor, idempotencyKey: intent.idempotencyKey }) });
-      const data = await response.json().catch(() => ({}));
-      if (response.ok) {
-        const result = refundResultSchema.parse(data);
-        clearRefundIntent(); setLastRefund(result); setRefundOpen(false); setRefundText(""); accept(result.paymentRequest); void refreshHistory();
-        setRefundNotice(`Refunded ${money(result.refund.amountMinor)} on ${intent.orderReference}.`);
-      } else if (response.status >= 400 && response.status < 500 && response.status !== 401) {
-        clearRefundIntent(); setRefundNotice(data.error ?? "UNIFY rejected this refund.");
-      } else setRefundNotice(`${data.error ?? "Refund outcome unknown."} Use Check refund to retry safely.`);
-    } catch { setRefundNotice("Refund outcome unknown. Use Check refund to retry safely with the same reference."); }
-    finally { guard.current = false; setBusy(false); }
-  }
+  useEffect(() => {
+    void refundClient.hydrate();
+    const refresh = () => { void refundClient.hydrate(); };
+    window.addEventListener("storage", refresh); window.addEventListener("focus", refresh);
+    const unsubscribe = refundClient.subscribe(() => {
+      const outcome = refundClient.getSnapshot().outcome;
+      if (!outcome || handledOutcome.current === outcome.id) return;
+      handledOutcome.current = outcome.id;
+      if (outcome.status === "COMPLETED" && outcome.result && outcome.paymentRequestId) {
+        setRefundOpen(false); setRefundText(""); setRefundNotice(`Refunded ${money(outcome.amountMinor)}.`);
+        void api(`/${outcome.paymentRequestId}`).then(data => {
+          const paymentRequest = requestSchema.parse(data);
+          if (paymentRequest.id !== outcome.paymentRequestId) throw new Error("Receipt reference mismatch.");
+          setLastRefund({ refund: { ...outcome.result!.refund, paymentRequestId: paymentRequest.id, transactionId: outcome.originalTransactionId }, paymentRequest });
+          accept(paymentRequest); void refreshHistory();
+        }).catch(() => setRefundNotice("Refund confirmed. Refresh the sale to retrieve its receipt."));
+      } else setRefundNotice(outcome.rejection?.message ?? "Refund cancelled.");
+    });
+    return () => { unsubscribe(); window.removeEventListener("storage", refresh); window.removeEventListener("focus", refresh); };
+    // Browser storage and the recovery controller are stable for this terminal mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refundClient]);
   function startRefund(sale: PaymentRequest, amountMinor: number | null) {
-    if (pendingRefund) { setRefundNotice("Check the unconfirmed refund before starting another."); return; }
+    if (refundBlocked || guard.current) { setRefundNotice("Recover the pending refund before starting another."); return; }
     if (!amountMinor || amountMinor > sale.refundableMinor) { setRefundNotice(`Enter an amount up to ${money(sale.refundableMinor)}.`); return; }
-    void submitRefund({ requestId: sale.id, orderReference: sale.orderReference, amountMinor, idempotencyKey: crypto.randomUUID() });
+    void refundClient.submit({ paymentRequestId: sale.id, amountMinor });
   }
   function printView(view: "receipt" | "refund") { setPrinting(view); setTimeout(() => window.print(), 0); }
   useEffect(() => {
@@ -69,7 +81,7 @@ export function Terminal() {
     try { const raw = JSON.parse(localStorage.getItem(STORAGE) ?? "null"); const sale = saleSchema.parse(raw?.sale); sale.items = sale.items.map((item) => ({ ...item, id: item.id ?? crypto.randomUUID() })); initial = { sale, submitted: raw.submitted === true, requestId: /^[A-Za-z0-9_-]{32}$/.test(raw.requestId ?? "") ? raw.requestId : undefined, snapshots: raw.snapshots && typeof raw.snapshots === "object" ? raw.snapshots : {} }; }
     catch { initial = { sale: newSale(), submitted: false, snapshots: {} }; }
     // eslint-disable-next-line react-hooks/set-state-in-effect -- Hydrate browser-only persistent storage after server rendering.
-    persist(initial); setPendingRefund(readRefundIntent()); setNow(Date.now()); void refreshHistory();
+    persist(initial); setNow(Date.now()); void refreshHistory();
     if(initial.requestId) void api(`/${initial.requestId}`).then((result) => accept(requestSchema.parse(result))).catch((error) => setError(error.message));
     const tick = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(tick);
     // Storage is hydrated once; subsequent changes are synchronously persisted.
@@ -138,10 +150,12 @@ export function Terminal() {
         {saved.sale.items.map((item,index) => <div className="item-row" key={item.id ?? `${saved.sale.idempotencyKey}-${index}`}><input aria-label={`Item ${index + 1} description`} disabled={!editable} maxLength={120} value={item.description} onChange={(event) => updateItems(saved.sale.items.map((old,i) => i === index ? { ...old, description: event.target.value } : old))} /><input aria-label={`Item ${index + 1} quantity`} disabled={!editable} type="number" min={1} max={999} step={1} value={item.quantity} onChange={(event) => updateItems(saved.sale.items.map((old,i) => i === index ? { ...old, quantity: Number(event.target.value) } : old))} /><PriceInput value={item.unitMinor} disabled={!editable} onChange={(value) => updateItems(saved.sale.items.map((old,i) => i === index ? { ...old, unitMinor: value } : old))} /><strong>{money(item.quantity * item.unitMinor)}</strong><button className="remove" aria-label={`Remove item ${index + 1}`} disabled={!editable || saved.sale.items.length <= 1} onClick={() => updateItems(saved.sale.items.filter((_,i) => i !== index))}>×</button></div>)}
         <button className="quiet add" disabled={!editable || saved.sale.items.length >= 30} onClick={() => updateItems([...saved.sale.items, { id: crypto.randomUUID(), description: "New item", quantity: 1, unitMinor: 100 }])}>+ Add item</button>
         <div className="total"><span>Sale total <small>ZAR · no purchase commission</small></span><strong>{money(total)}</strong></div>
-        {editable ? <button className="button full" disabled={busy} onClick={() => void create()}>Create UNIFY checkout <span>↗</span></button> : <div className="actions"><button className="button" disabled={busy} onClick={() => void recoverOrCancel()}>{busy ? "Checking…" : saved.requestId ? "Refresh status" : "Recover sale"}</button>{request?.status === "PENDING" && <button className="secondary" disabled={busy} onClick={() => void recoverOrCancel(true)}>Cancel unpaid sale</button>}{terminal && <button className="secondary" onClick={() => { persist({ sale: newSale(), submitted: false, snapshots: saved.snapshots }); setRequest(undefined); setError(""); setRefundOpen(false); setRefundNotice(""); }}>New sale +</button>}</div>}
+        {editable ? <button className="button full" disabled={busy} onClick={() => void create()}>Create UNIFY checkout <span>↗</span></button> : <div className="actions"><button className="button" disabled={busy} onClick={() => void recoverOrCancel()}>{busy ? "Checking…" : saved.requestId ? "Refresh status" : "Recover sale"}</button>{request?.status === "PENDING" && <button className="secondary" disabled={busy} onClick={() => void recoverOrCancel(true)}>Cancel unpaid sale</button>}{terminal && <button className="secondary" disabled={busy} onClick={() => { persist({ sale: newSale(), submitted: false, snapshots: saved.snapshots }); setRequest(undefined); setError(""); setRefundOpen(false); setRefundNotice(""); }}>New sale +</button>}</div>}
         {saved.submitted && <p className="helper">Sale terms are fixed. Check this reference before starting another checkout.</p>}
         {error && <p role="alert" className="notice">{error}</p>}
-        {pendingRefund && <div role="alert" className="notice">Refund of {money(pendingRefund.amountMinor)} on {pendingRefund.orderReference} is not confirmed yet. <button className="quiet" disabled={busy} onClick={() => void submitRefund(pendingRefund)}>{busy ? "Checking…" : "Check refund"}</button></div>}
+        {pendingRefund && <div role="alert" className="notice">Refund of {money(pendingRefund.amountMinor)} on {(recovery.operation?.paymentRequestId === request?.id ? request?.orderReference : pendingRefund.paymentRequestId)} is not confirmed yet. <button className="quiet" disabled={busy} onClick={() => void refundClient.recover()}>{busy ? "Checking…" : "Check refund"}</button> <button className="quiet" disabled={busy} onClick={() => void refundClient.recover("cancel")}>Cancel pending refund</button></div>}
+        {recovery.error && <p role="alert" className="notice">{recovery.error} <button className="quiet" disabled={busy} onClick={() => void refundClient.hydrate()}>Retry recovery</button></p>}
+        {!recovery.hydrated && !recovery.error && <p className="helper">Checking pending refunds...</p>}
         {refundNotice && <p role="status" className="helper">{refundNotice}</p>}
       </div>
       <aside className="checkout-pane">
@@ -149,11 +163,11 @@ export function Terminal() {
         {request ? <div className="checkout"><p className="vendor">{request.vendorName} <span>{request.branchName}</span></p><h2>{money(request.amountMinor)}</h2><p className="order">{request.orderReference}</p><div className={`qr-plane ${request.status === "PAID" ? "paid" : ""}`}>
           {request.status === "PENDING" && remaining > 0 && qr?.id === request.id ? <img src={qr.url} alt="Scan with the UNIFY wallet to review this sale" width={320} height={320} /> : <div className="outcome"><span>{request.status === "PAID" ? "✓" : request.status === "CANCELLED" ? "×" : "—"}</span><h3>{request.status === "PAID" ? "Payment confirmed" : request.status === "PENDING" ? "Checking expiry" : request.status === "EXPIRED" ? "Request expired" : "Sale cancelled"}</h3></div>}
         </div><p className="status" aria-live="polite">{request.status === "PENDING" ? remaining > 0 ? `Scan in UNIFY · ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2,"0")} remaining` : "Awaiting server confirmation of expiry" : request.status === "PAID" ? "Payment received in the vendor wallet" : "This request cannot be paid"}</p><p className="helper">{synced ? `Last confirmed ${synced}` : "Checking UNIFY"}</p>
-        {request.status === "PAID" && <div className="receipt-summary"><p>Transaction: {request.transactionId}</p><p>Completed: {new Date(request.completedAt!).toLocaleString("en-ZA")}</p>{request.refundedMinor > 0 && <p>Refunded {money(request.refundedMinor)} of {money(request.amountMinor)}</p>}<div className="actions"><button className="secondary" onClick={() => printView("receipt")}>Print payment receipt</button>{slip && <button className="secondary" onClick={() => printView("refund")}>Print refund slip</button>}{request.refundableMinor > 0 && !pendingRefund && !refundOpen && <button className="secondary" disabled={busy} onClick={() => { setRefundOpen(true); setRefundText(""); setRefundNotice(""); }}>Refund…</button>}</div>
-          {refundOpen && request.refundableMinor > 0 && !pendingRefund && <div className="refund-panel"><p className="eyebrow">REFUND TO STUDENT WALLET</p><p>Up to {money(request.refundableMinor)} remaining.</p><button className="secondary" disabled={busy} onClick={() => startRefund(request, request.refundableMinor)}>Full remaining · {money(request.refundableMinor)}</button><div className="refund-row"><input aria-label="Refund amount in rand" inputMode="decimal" placeholder="Custom amount" value={refundText} disabled={busy} onChange={(event) => setRefundText(event.target.value)} /><button className="secondary" disabled={busy || !refundText} onClick={() => startRefund(request, parsePrice(refundText))}>Refund amount</button><button className="quiet" disabled={busy} onClick={() => setRefundOpen(false)}>Cancel</button></div></div>}</div>}</div> : <div className="empty-checkout"><div className="qr-placeholder"><span>U</span></div><h2>Ready when you are.</h2><p>Create the sale to display a secure payment QR.</p><small>The student reviews and approves the fixed total in their wallet.</small></div>}
+        {request.status === "PAID" && <div className="receipt-summary"><p>Transaction: {request.transactionId}</p><p>Completed: {new Date(request.completedAt!).toLocaleString("en-ZA")}</p>{request.refundedMinor > 0 && <p>Refunded {money(request.refundedMinor)} of {money(request.amountMinor)}</p>}<div className="actions"><button className="secondary" onClick={() => printView("receipt")}>Print payment receipt</button>{slip && <button className="secondary" onClick={() => printView("refund")}>Print refund slip</button>}{request.refundableMinor > 0 && !refundBlocked && !refundOpen && <button className="secondary" disabled={busy} onClick={() => { setRefundOpen(true); setRefundText(""); setRefundNotice(""); }}>Refund…</button>}</div>
+          {refundOpen && request.refundableMinor > 0 && !refundBlocked && <div className="refund-panel"><p className="eyebrow">REFUND TO STUDENT WALLET</p><p>Up to {money(request.refundableMinor)} remaining.</p><button className="secondary" disabled={busy} onClick={() => startRefund(request, request.refundableMinor)}>Full remaining · {money(request.refundableMinor)}</button><div className="refund-row"><input aria-label="Refund amount in rand" inputMode="decimal" placeholder="Custom amount" value={refundText} disabled={busy} onChange={(event) => setRefundText(event.target.value)} /><button className="secondary" disabled={busy || !refundText} onClick={() => startRefund(request, parsePrice(refundText))}>Refund amount</button><button className="quiet" disabled={busy} onClick={() => setRefundOpen(false)}>Cancel</button></div></div>}</div>}</div> : <div className="empty-checkout"><div className="qr-placeholder"><span>U</span></div><h2>Ready when you are.</h2><p>Create the sale to display a secure payment QR.</p><small>The student reviews and approves the fixed total in their wallet.</small></div>}
       </aside>
     </section>
-    <section className="history"><div className="section-title"><div><p className="eyebrow">FROM UNIFY</p><h2>Recent sales</h2></div><button className="quiet" onClick={() => void refreshHistory()}>Refresh history ↻</button></div><div className="table-scroll"><table><thead><tr><th>Order reference</th><th>Branch</th><th>Amount</th><th>Outcome</th><th>Created</th><th /></tr></thead><tbody>{history.map((sale) => <tr key={sale.id}><td>{sale.orderReference}</td><td>{sale.branchName}</td><td>{money(sale.amountMinor)}</td><td><span className={`state state-${sale.status.toLowerCase()}`}>{sale.status}</span>{sale.refundedMinor > 0 && <small className="refund-note">Refunded {money(sale.refundedMinor)} of {money(sale.amountMinor)}</small>}</td><td>{new Date(sale.createdAt).toLocaleString("en-ZA")}</td><td><button className="quiet" disabled={busy || saved.submitted && !terminal && saved.requestId !== sale.id} onClick={() => viewSale(sale)}>View →</button>{sale.status === "PAID" && sale.refundableMinor > 0 && <button className="quiet" disabled={busy || Boolean(pendingRefund) || saved.submitted && !terminal && saved.requestId !== sale.id} onClick={() => viewSale(sale, true)}>Refund</button>}</td></tr>)}</tbody></table></div>{!history.length && <p className="helper">Your confirmed and unpaid requests will appear here.</p>}{cursor && <button className="quiet" onClick={() => void refreshHistory(cursor)}>Load more sales</button>}</section>
+    <section className="history"><div className="section-title"><div><p className="eyebrow">FROM UNIFY</p><h2>Recent sales</h2></div><button className="quiet" onClick={() => void refreshHistory()}>Refresh history ↻</button></div><div className="table-scroll"><table><thead><tr><th>Order reference</th><th>Branch</th><th>Amount</th><th>Outcome</th><th>Created</th><th /></tr></thead><tbody>{history.map((sale) => <tr key={sale.id}><td>{sale.orderReference}</td><td>{sale.branchName}</td><td>{money(sale.amountMinor)}</td><td><span className={`state state-${sale.status.toLowerCase()}`}>{sale.status}</span>{sale.refundedMinor > 0 && <small className="refund-note">Refunded {money(sale.refundedMinor)} of {money(sale.amountMinor)}</small>}</td><td>{new Date(sale.createdAt).toLocaleString("en-ZA")}</td><td><button className="quiet" disabled={busy || saved.submitted && !terminal && saved.requestId !== sale.id} onClick={() => viewSale(sale)}>View →</button>{sale.status === "PAID" && sale.refundableMinor > 0 && <button className="quiet" disabled={busy || refundBlocked || saved.submitted && !terminal && saved.requestId !== sale.id} onClick={() => viewSale(sale, true)}>Refund</button>}</td></tr>)}</tbody></table></div>{!history.length && <p className="helper">Your confirmed and unpaid requests will appear here.</p>}{cursor && <button className="quiet" onClick={() => void refreshHistory(cursor)}>Load more sales</button>}</section>
     {printing === "refund" && slip ? <section className="print-receipt"><h1>UNIFY · Refund slip</h1><p>TEST-MONEY DEMONSTRATION</p><h2>{slip.paymentRequest.vendorName}</h2><p>{slip.paymentRequest.branchName}</p><p>Order: {slip.paymentRequest.orderReference}</p><h2>Refund {money(slip.refund.amountMinor)}</h2><p>Refunded to: UNIFY wallet</p><p>Refund: {slip.refund.id}</p><p>Original transaction: {slip.refund.transactionId}</p><p>Refunded so far: {money(slip.paymentRequest.refundedMinor)} of {money(slip.paymentRequest.amountMinor)}</p><p>Refunded: {slip.refund.createdAt}</p><p>Authoritative refund confirmed by UNIFY.</p></section> : request?.status === "PAID" && <section className="print-receipt"><h1>UNIFY · Payment receipt</h1><p>TEST-MONEY DEMONSTRATION</p><h2>{request.vendorName}</h2><p>{request.branchName}</p><p>Order: {request.orderReference}</p>{receiptItems?.map((item,index) => <p key={index}>{item.quantity} × {item.description} · {money(item.quantity * item.unitMinor)}</p>)}<h2>Total {money(request.amountMinor)}</h2><p>Payment method: UNIFY wallet</p><p>Transaction: {request.transactionId}</p>{request.refundedMinor > 0 && <p>Refunded: {money(request.refundedMinor)} of {money(request.amountMinor)}</p>}<p>Completed: {request.completedAt}</p><p>Authoritative payment receipt. Item breakdown is a local sale snapshot when available.</p></section>}
     <footer>UNIFY POS simulator · Prepared sales and authoritative wallet payments · Test funds only.</footer>
   </main>;
