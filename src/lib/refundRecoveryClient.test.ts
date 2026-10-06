@@ -59,4 +59,51 @@ describe("durable refund browser recovery", () => {
     await client.hydrate(); await client.submit({ transactionId: "spend-1", amountMinor: 2000 }); expect(local.map.size).toBe(1);
     await client.recover("cancel"); expect(client.getSnapshot().outcome?.status).toBe("CANCELLED"); expect(local.map.size).toBe(0);
   });
+  it("recovers by operation ID after authorization returns, without registering new terms", async () => {
+    const local = storage(); const key = "frozen-key";
+    local.setItem("unify.refund-registration.v1:vendor-1:user:owner-1", JSON.stringify({ transactionId: "spend-1", amountMinor: 2000, idempotencyKey: key, operationId: "operation-1" }));
+    let denied = true;
+    const network = vi.fn(async (url: string | URL | Request, options?: RequestInit) => {
+      if (String(url) === "/refunds") return json({ ...scope, operation: null });
+      if (denied) return json({ error: "Sign in again." }, 403);
+      return json(op(key, options?.method ? "COMPLETED" : "PENDING"));
+    });
+    const client = new RefundRecoveryClient({ baseUrl: "/refunds", storage: () => local, fetch: network });
+    await client.hydrate(); expect(local.map.size).toBe(1);
+    denied = false; await client.recover();
+    expect(client.getSnapshot().outcome?.status).toBe("COMPLETED");
+    expect(network.mock.calls.filter(([url, options]) => url === "/refunds" && options?.method)).toHaveLength(0);
+  });
+  it("keeps another operator's stored reference and clears only the imported legacy key", async () => {
+    const local = storage(); local.setItem("unify.refund-registration.v1:other-vendor:api:old-key", "old-record");
+    const clearLegacy = vi.fn();
+    const legacy = { transactionId: "spend-1", amountMinor: 2000, idempotencyKey: "legacy-key" };
+    const client = new RefundRecoveryClient({ baseUrl: "/refunds", storage: () => local, legacyDraft: () => legacy, clearLegacy, fetch: async (url, options) => {
+      if (!options?.method) return json({ ...scope, operation: op("different-key") });
+      return json(op("different-key", "COMPLETED"));
+    } });
+    await client.hydrate(); await client.recover();
+    expect(clearLegacy).not.toHaveBeenCalled(); expect(local.getItem("unify.refund-registration.v1:other-vendor:api:old-key")).toBe("old-record");
+    const imported = new RefundRecoveryClient({ baseUrl: "/refunds", storage: () => local, legacyDraft: () => legacy, clearLegacy, fetch: async (url, options) => {
+      if (!options?.method) return json({ ...scope, operation: null });
+      return json(op("legacy-key", "COMPLETED"));
+    } });
+    await imported.hydrate(); expect(clearLegacy).toHaveBeenCalledTimes(1);
+  });
+  it("a late terminal response cannot delete another tab's newer instruction", async () => {
+    const local = storage(); let release!: (response: Response) => void;
+    const delayed = new Promise<Response>(resolve => { release = resolve; });
+    let key = "";
+    const client = new RefundRecoveryClient({ baseUrl: "/refunds", storage: () => local, fetch: async (url, options) => {
+      if (!options?.method) return json({ ...scope, operation: null });
+      if (String(url).endsWith("/execute")) return delayed;
+      key = JSON.parse(String(options.body)).idempotencyKey; return json(op(key));
+    } });
+    await client.hydrate(); const submission = client.submit({ transactionId: "spend-1", amountMinor: 2000 });
+    while (!client.getSnapshot().operation) await new Promise(resolve => setTimeout(resolve, 0));
+    const storeKey = "unify.refund-registration.v1:vendor-1:user:owner-1";
+    local.setItem(storeKey, JSON.stringify({ transactionId: "spend-2", amountMinor: 1000, idempotencyKey: "newer-key" }));
+    release(json(op(key, "COMPLETED"))); await submission;
+    expect(JSON.parse(local.getItem(storeKey)!).idempotencyKey).toBe("newer-key");
+  });
 });
