@@ -14,9 +14,19 @@ const expected = createHmac("sha256", process.env.UNIFY_PAYMENT_WEBHOOK_SECRET)
 const valid = timingSafeEqual(expected, Buffer.from(signature.slice(7), "hex"));
 ```
 
+## Refund events
+
+`payment_request.refunded` (version 1) arrives once per completed refund on a sale, whether the POS or the vendor portal issued it, with the same headers, signature and retry schedule. Its strict body carries the sale terms (`amountMinor` is the original sale total, `status` is always `PAID`), the `refund` (`id`, `amountMinor`, `source: PORTAL | API`, `createdAt`), and `refundedMinor` / `refundableMinor` as of that refund, which must add up to the sale total.
+
+The receiver accepts a refund event only after rereading the request from UNIFY and checking that branch, request ID, order reference, currency, transaction and sale total match, the request is still `PAID`, its `refunds[]` contains `refund.id` with the same amount, and its authoritative `refundedMinor` is at least the event's (later refunds may already exist). A mismatch returns 409 and the event is retried. The acknowledgement adds `refundId`. Like other events, duplicate deliveries have no side effects.
+
+Until the simulator is deployed with this change, it rejects refund events (strict schema → 400); UNIFY retries them on the normal schedule, and exhausted ones can be retried from owner history.
+
+## Delivery
+
 Every delivery rereads UNIFY; duplicate deliveries have no side effects. A real merchant system should durably deduplicate event IDs before fulfilling an order. This simulator has no database and does not perform fulfilment or post money. Browser polling continues every two seconds with failure backoff. Only an authoritative `PAID` response shows confirmation and enables a receipt. The browser does not depend on the receiver or scheduler being available.
 
-UNIFY creates one immutable event transactionally for paid/cancelled/expired requests. Delivery happens after commit, then a signed QStash dispatcher runs every five minutes. Six automatic attempts use initial delivery followed by 5m, 15m, 1h, 6h and 24h delays. Owner history records attempts, HTTP results and next retry. Exhaustion needs manual retry. Disabling/replacing configuration parks outstanding events; old events move to the replacement only through an explicit owner retry.
+UNIFY creates one immutable event transactionally for paid/cancelled/expired requests, and one per completed refund. Delivery happens after commit, then a signed QStash dispatcher runs every five minutes. Six automatic attempts use initial delivery followed by 5m, 15m, 1h, 6h and 24h delays. Owner history records attempts, HTTP results and next retry. Exhaustion needs manual retry. Disabling/replacing configuration parks outstanding events; old events move to the replacement only through an explicit owner retry.
 
 For the coordinated demo:
 
@@ -27,5 +37,6 @@ For the coordinated demo:
 5. Demonstrate cancelled and ten-minute-expired QRs.
 6. Retry a delivered event in owner history; confirm another valid acknowledgement and no additional debit.
 7. With callbacks/scheduler disabled, repeat a small sale and confirm polling still obtains its receipt. Restore callbacks afterwards.
+8. Refund part of a sale from the POS and the rest from the vendor portal; confirm a delivered, acknowledged `payment_request.refunded` event for each in owner history.
 
-Physical acceptance is pending. CI covers receiver authentication, duplicate delivery, term mismatches, unsafe signatures, upstream failure and existing operator isolation. Full portal contract and setup: [portal checkout documentation](https://github.com/AdvanceUCT/unify-admin-portal/blob/feature/checkout-reliability/docs/checkout-reliability.md).
+Physical acceptance is pending. CI covers receiver authentication, duplicate delivery, term mismatches, unsafe signatures, upstream failure, refund event validation and existing operator isolation. Full portal contract and setup: [portal checkout documentation](https://github.com/AdvanceUCT/unify-admin-portal/blob/feature/checkout-reliability/docs/checkout-reliability.md).
