@@ -22,7 +22,7 @@ The browser stores sale drafts and optional item snapshots. UNIFY stores request
 Use Node 24 and `npm ci`. Copy `.env.example` to `.env.local` and configure:
 
 - `UNIFY_API_BASE_URL`: fixed HTTPS origin of the portal, without a path.
-- `UNIFY_VENDOR_API_KEY`: server-only key with `payments:create`, `payments:read`, `payments:cancel`; restrict it to the configured test branch.
+- `UNIFY_VENDOR_API_KEY`: server-only key with `payments:create`, `payments:read`, `payments:cancel` and `refunds:create`; restrict it to the configured test branch. Keys are immutable: to add `refunds:create`, revoke and reissue the key in the vendor portal's Integrations, update this value in Vercel and redeploy.
 - `UNIFY_BRANCH_ID`: an approved payment-enabled branch of the dedicated test vendor.
 - `POS_ORIGIN`: exact public HTTPS origin, used for same-origin mutation checks.
 - `POS_OPERATOR_PASSWORD`: random password of at least 16 characters.
@@ -44,6 +44,8 @@ Content-Type: application/json
 
 Read `GET /api/vendor/v1/payment-requests/{id}`, list `GET /api/vendor/v1/payment-requests?limit=20`, or cancel with `POST /api/vendor/v1/payment-requests/{id}/cancel`. The response contains an opaque `unifywallet://pay-request/{id}` QR and server expiry. An order reference and creation key identify one immutable sale; retries must retain both and its total.
 
+Refund a PAID sale with `POST /api/vendor/v1/payment-requests/{id}/refunds` and `{"amountMinor":1500,"idempotencyKey":"stable-refund-key"}` (scope `refunds:create`). Partial and repeated refunds are allowed up to the sale total, with no time limit; the same key replays the original refund. Request reads include `refundedMinor`, `refundableMinor`, `refundStatus` and `refunds[]`.
+
 States are `PENDING`, `PAID`, `CANCELLED`, `EXPIRED`. Requests expire after ten minutes. Only `PAID` permits printing a receipt. A browser countdown never asserts an outcome. Network failures retain the sale and back off polling to 30 seconds; reconnect checks that same reference. Cancel and pay races are decided in UNIFY's database.
 
 ## Demo acceptance
@@ -55,8 +57,11 @@ States are `PENDING`, `PAID`, `CANCELLED`, `EXPIRED`. Requests expire after ten 
 5. Create and cancel an unpaid sale; verify the wallet cannot pay it.
 6. Let a request expire; verify neither a stale QR nor a delayed approval can debit it.
 7. Interrupt connectivity after create/pay submission; recover the original reference and verify only one request/spend exists. Refresh the browser and recover recent sales.
+8. On a paid sale choose **Refund…**, then **Full remaining** or a custom amount. The receipt shows "Refunded R x of R y", the student wallet shows the refund, and **Print refund slip** prints the confirmed refund. Refunds can also start from **Refund** on a paid row in Recent sales.
+9. Refund from the vendor portal as well; the POS learns of it from the `payment_request.refunded` callback and its next read of the sale. A refund above the remaining amount is rejected.
+10. Interrupt connectivity during a refund. The terminal keeps the refund (amount and key) in browser storage before calling UNIFY and shows **Check refund**, which retries with the same key, so UNIFY returns the original refund instead of refunding twice.
 
-Signed payment callbacks are documented in [payment-callbacks.md](docs/payment-callbacks.md). Refund execution, FIFO refund obligations and payout changes are separate increments. The API supports refund scopes for future use; this terminal has no refund control.
+Signed payment callbacks are documented in [payment-callbacks.md](docs/payment-callbacks.md). The refund, vendor overdraft and payout policy lives in the portal's `docs/payments/REFUNDS_OVERDRAFT_PAYOUTS.md`.
 
 ## Checks and deployment
 
@@ -72,4 +77,4 @@ The deployed demo uses the approved TechNest vendor and Rondebosch Branch. Its v
 
 Portal, wallet and simulator CI checks passed. The payment checks exercised concurrent payers, repeat submissions, cancellation, expiry, insufficient funds and transaction rollback against PostgreSQL. Deployed simulator checks confirmed protected routes, session cookies, same-origin changes, integer totals, recovery after a lost creation response, repeated cancellation and ten-minute expiry. A signed Android APK was compiled on Windows; its release certificate matches the portal's Android App Links certificate and it contains only phone ARM architectures.
 
-Physical phone acceptance is still outstanding. Run the demo steps above and match the completed payment and receipt across the wallet, POS and portal before closing AD-218 or AD-219. Supporting wallet changes do not complete AD-224, AD-225 or AD-227. Refund execution and callbacks remain separate work.
+Physical phone acceptance is still outstanding. Run the demo steps above and match the completed payment and receipt across the wallet, POS and portal before closing AD-218 or AD-219. Supporting wallet changes do not complete AD-224, AD-225 or AD-227.
