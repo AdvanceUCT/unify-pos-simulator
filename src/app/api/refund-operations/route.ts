@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { isOperator, assertOrigin } from "@/lib/operator";
-import { refundOperationSchema, refundRecoverySchema, refundRegistrationSchema } from "@/lib/refundOperationContract";
-import { upstreamRefundOperation } from "@/lib/upstream";
+import { isOperator, assertOrigin } from "../../../lib/operator";
+import { refundOperationSchema, refundRecoverySchema, refundRegistrationSchema } from "../../../lib/refundOperationContract";
+import { upstreamRefundOperation } from "../../../lib/upstream";
 export async function GET() {
  if (!await isOperator()) return NextResponse.json({ error: "Operator login required." }, { status: 401 });
  try {
